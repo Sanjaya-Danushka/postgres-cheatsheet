@@ -75,7 +75,7 @@ computer. That is why the same SQL works on your laptop and in production.
 
 ## The words you will see everywhere
 
-Learn these six and the rest of this document makes sense.
+Learn these few words and the rest of this document makes sense.
 
 ```
 PostgreSQL server  ──►  database  ──►  schema  ──►  table  ──►  row
@@ -437,7 +437,8 @@ TRUNCATE notes CASCADE;           -- also empties tables that reference it
 ```
 
 Faster than `DELETE` because it does not log each row, but it cannot have a
-`WHERE`, and in PostgreSQL it cannot run inside a transaction.
+`WHERE`. Unlike MySQL, `TRUNCATE` **is** transactional in PostgreSQL — inside
+`BEGIN`/`COMMIT` you can `ROLLBACK` it and get the rows back.
 
 ---
 
@@ -520,6 +521,11 @@ CREATE TABLE users (
 Constraints stop bad data from ever getting in. Set them up front.
 
 ```sql
+CREATE TABLE teams (
+  id   SERIAL PRIMARY KEY,
+  name TEXT NOT NULL
+);
+
 CREATE TABLE users (
   id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   email      TEXT NOT NULL UNIQUE,
@@ -530,6 +536,10 @@ CREATE TABLE users (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
+
+> `users` references `teams`, so **`teams` must already exist** — a foreign key
+> cannot point at a table that is not there yet. If you skip it you get
+> `relation "teams" does not exist`.
 
 | Constraint | What it does |
 |---|---|
@@ -732,12 +742,12 @@ CREATE ROLE readonly WITH LOGIN PASSWORD 'x';        -- will only get read grant
 CREATE ROLE reporting;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO reporting;
 
--- change
-ALTER ROLE alexa WITH PASSWORD 'newpassword';
-ALTER ROLE alexa CREATEDB;           -- may create databases
-ALTER ROLE alexa CREATEDB NOCREATEDB;-- may not
-ALTER ROLE alexa NOLOGIN;            -- lock the account out
-ALTER ROLE alexa VALID UNTIL '2027-01-01';   -- temporary account
+  -- change
+  ALTER ROLE alexa WITH PASSWORD 'newpassword';
+  ALTER ROLE alexa CREATEDB;           -- may create databases
+  ALTER ROLE alexa NOCREATEDB;         -- may not (note: on its own, not "CREATEDB NOCREATEDB")
+  ALTER ROLE alexa NOLOGIN;            -- lock the account out
+  ALTER ROLE alexa VALID UNTIL '2027-01-01';   -- temporary account
 
 -- nest roles
 GRANT reporting TO alexa;            -- alexa now has everything reporting has
@@ -767,6 +777,11 @@ Built-in roles you can grant instead of inventing permissions:
 
 **Never run as the `postgres` superuser in application code.** Create a normal
 role for the app and grant it only what it needs.
+
+> **Gotcha:** PostgreSQL rejects a positive and negative form of the same option
+> in one statement. `ALTER ROLE alexa CREATEDB NOCREATEDB;` fails with
+> *conflicting or redundant options*. Use `NOCREATEDB` on its own. The same
+> applies to `LOGIN NOLOGIN` and `SUPERUSER NOSUPERUSER`.
 
 ---
 
@@ -849,6 +864,12 @@ DROP TABLE notes;
 DROP TABLE IF EXISTS notes;
 DROP TABLE notes CASCADE;   -- also drops anything that depends on it
 ```
+
+> **Gotcha:** changing a column's `TYPE` fails with
+> `cannot alter type of a column used by a view or rule` if **any view or
+> materialized view** reads that column. Drop the dependent view first, change
+> the type, then recreate the view. Adding and dropping columns has no such
+> restriction.
 
 ### Comments — the best thing nobody uses
 
@@ -958,7 +979,12 @@ COMMIT;   -- would be wrong; use ROLLBACK instead
 ```
 
 **Things that cannot run inside a transaction:** `CREATE DATABASE`,
-`DROP DATABASE`, `VACUUM`, `CREATE INDEX CONCURRENTLY`, `TRUNCATE`.
+`DROP DATABASE`, `VACUUM`, `CREATE INDEX CONCURRENTLY`, and `REINDEX
+CONCURRENTLY`.
+
+`TRUNCATE` **can** — it is transactional in PostgreSQL, so a `ROLLBACK` brings
+the rows back. This is the opposite of MySQL, where `TRUNCATE` causes an
+implicit commit.
 
 ---
 
@@ -991,14 +1017,20 @@ CREATE TABLE notes (id SERIAL PRIMARY KEY, title TEXT);
 ```sql
 CREATE SEQUENCE ticket_seq START 1000;
 
-SELECT nextval('ticket_seq');   -- 1000
-SELECT currval('ticket_seq');   -- 1000, without advancing
+SELECT nextval('ticket_seq');   -- 1000, and advances the counter
+SELECT currval('ticket_seq');   -- 1000, shows the last value THIS SESSION produced
 SELECT setval('ticket_seq', 1); -- reset to 1
 ALTER SEQUENCE ticket_seq RESTART WITH 1;
 DROP SEQUENCE ticket_seq;
 
 SELECT last_value FROM notes_id_seq;
 ```
+
+> `currval` only works **after `nextval` has been called in the same session**.
+> On a fresh connection you get
+> `currval of sequence "..." is not yet defined in this session` — that is the
+> documented behaviour, not a bug. Use `last_value` from the sequence (or
+> `setval`) if you need the current value from a different connection.
 
 ### Renumbering after deleting the highest rows
 
@@ -1623,6 +1655,9 @@ real database driver.
 | `ERROR: permission denied for database mydb` | missing CONNECT privilege | `GRANT CONNECT ON DATABASE mydb TO alexa;` |
 | `permission denied for table notes` | missing table privilege | `GRANT ALL ON notes TO alexa;` |
 | `ERROR: must be owner of table notes` | only the owner may alter a table | `ALTER TABLE notes OWNER TO alexa;` |
+| `cannot alter type of a column used by a view or rule` | a view or materialized view depends on that column | drop the view, change the type, recreate the view |
+| `currval of sequence "..." is not yet defined in this session` | `nextval` has not run in *this* connection | call `nextval` first, or read `last_value` from the sequence |
+| `conflicting or redundant options` | you combined `CREATEDB NOCREATEDB` (or `LOGIN NOLOGIN`) | use only the negative form: `ALTER ROLE alexa NOCREATEDB;` |
 | `ERROR: syntax error at or near "notes"` | missing semicolon between statements | end every statement with `;` |
 | `invalid integer value "notes" for connection option "port"` | you pasted multiple lines into the psql prompt | run statements one at a time, or use `psql -f file.sql` |
 | `unrecognized configuration parameter "databases"` | you used MySQL's `SHOW DATABASES` | `SELECT datname FROM pg_database;` |
